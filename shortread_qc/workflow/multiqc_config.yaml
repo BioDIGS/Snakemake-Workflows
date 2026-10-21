@@ -1,0 +1,21 @@
+title: "BioDIGS short-read QC"
+subtitle: "fastp adapter/poly-G/quality trimming + Bowtie2 host removal (T2T-CHM13)"
+intro_text: >
+  Raw = provider reads; clean = after fastp and removal of any pair with at least
+  one mate aligning to the human reference.
+
+# Name fastp/bowtie2 samples by file name ({sample}.fastp.json, {sample}.bowtie2.log)
+use_filename_as_sample_name:
+  - fastp
+  - bowtie2
+extra_fn_clean_exts:
+  - ".fastp"
+  - ".bowtie2"
+
+table_sample_merge:
+  "R1": "_R1"
+  "R2": "_R2"
+
+report_section_order:
+  biodigs_qc:
+    order: 1000

@@ -1,0 +1,10 @@
+# Dev-node profile. Used automatically by `snakemake` run from the repo root
+cores: 72
+resources:
+  - mem_mb=200000
+software-deployment-method: conda
+conda-prefix: .snakemake/conda       
+keep-going: true                     
+rerun-incomplete: true
+printshellcmds: true
+show-failed-logs: true

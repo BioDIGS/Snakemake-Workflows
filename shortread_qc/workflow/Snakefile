@@ -1,0 +1,685 @@
+# =============================================================================
+# BioDIGS short-read QC
+#
+#   raw PE reads ──► adapter ID (raw) ──► fastp (adapters, poly-G, cut_right,
+#   length ≥ 50) ──► Bowtie2 vs T2T-CHM13 (--very-sensitive --reorder) ──►
+#   keep ONLY pairs where both mates are unmapped (samtools fastq -f 12 -F 0x900)
+#   ──► clean reads ──► adapter ID (clean), seqkit, FastQC, MultiQC, md5,
+#   per-sample QC table, tool versions, optional human spike-in validation.
+#   Every R1 header is also scanned (instrument/run/flowcell/lane/index) to build
+#   results/sample_sheet.tsv: one row per sample recording where/how it was
+#   sequenced and what cleaning did to it.
+#
+# Run from the repository root:
+#   snakemake                      (uses profiles/default)
+# =============================================================================
+import csv
+import os
+import re
+import datetime
+
+configfile: "config/config.yaml"
+
+OUT = config["outdir"].rstrip("/")
+SCRIPTS = os.path.join(workflow.basedir, "scripts")
+ENVS = os.path.join(workflow.basedir, "envs")
+SPIKE = "SPIKECHECK"
+SPIKE_TAG = "HSSPIKE"
+
+
+# --- samples -------------------------------------------------------------------------- 
+def load_samples(path):
+    samples = {}
+    with open(path) as fh:
+        rows = [l for l in fh if l.strip() and not l.startswith("#")]
+    for row in csv.DictReader(rows, delimiter="\t"):
+        name = row["sample"].strip()
+        if not re.fullmatch(r"[A-Za-z0-9._-]+", name):
+            raise ValueError(f"samples.tsv: illegal characters in sample name '{name}'")
+        if name in samples:
+            raise ValueError(f"samples.tsv: duplicate sample '{name}'")
+        r1 = [p.strip() for p in row["r1"].split(",") if p.strip()]
+        r2 = [p.strip() for p in row["r2"].split(",") if p.strip()]
+        if not r1 or len(r1) != len(r2):
+            raise ValueError(f"samples.tsv: '{name}' needs the same number of R1 and R2 files")
+        samples[name] = {"1": r1, "2": r2}
+    return samples
+
+
+SAMPLES = load_samples(config["samples"])
+VAL = config.get("validation", {}) or {}
+VALIDATE = bool(VAL.get("enabled"))
+if VALIDATE:
+    if VAL.get("base_sample") not in SAMPLES:
+        raise ValueError("validation.base_sample must be a sample in samples.tsv")
+    if not VAL.get("human_fasta"):
+        raise ValueError("validation.human_fasta is required when validation is enabled")
+    if SPIKE in SAMPLES:
+        raise ValueError(f"'{SPIKE}' is reserved for the validation sample")
+    SAMPLES[SPIKE] = {
+        "1": [f"{OUT}/validation/spike_mix_R1.fastq.gz"],
+        "2": [f"{OUT}/validation/spike_mix_R2.fastq.gz"],
+    }
+REAL_SAMPLES = [s for s in SAMPLES if s != SPIKE]
+
+wildcard_constraints:
+    sample="|".join(re.escape(s) for s in SAMPLES),
+    mate="1|2",
+
+
+def raw(sample, mate):
+    """Raw input for one mate; multi-lane samples are concatenated first."""
+    files = SAMPLES[sample][mate]
+    return files[0] if len(files) == 1 else f"{OUT}/raw_merged/{sample}_R{mate}.fastq.gz"
+
+
+# --- params --------------------------------------------------------------------------
+def fastp_args():
+    """fastp options shared by every sample (adapters are added per sample)."""
+    f = config["fastp"]
+    a = []
+    if f.get("detect_adapter_for_pe", True):
+        a.append("--detect_adapter_for_pe")
+    if f.get("trim_poly_g", True):
+        a.append(f"--trim_poly_g --poly_g_min_len {f.get('poly_g_min_len', 10)}")
+    else:
+        a.append("--disable_trim_poly_g")
+    if int(f.get("max_len", 0) or 0) > 0:
+        a.append(f"--max_len1 {int(f['max_len'])} --max_len2 {int(f['max_len'])}")
+    if f.get("cut_right", True):
+        a.append(f"--cut_right --cut_right_window_size {f['cut_right_window_size']} "
+                 f"--cut_right_mean_quality {f['cut_right_mean_quality']}")
+    a.append(f"--qualified_quality_phred {f['qualified_quality_phred']}")
+    a.append(f"--unqualified_percent_limit {f['unqualified_percent_limit']}")
+    a.append(f"--n_base_limit {f['n_base_limit']}")
+    a.append(f"--length_required {f['length_required']}")
+    if f.get("dedup", False):
+        a.append("--dedup")
+    if f.get("extra"):
+        a.append(str(f["extra"]))
+    return " ".join(a)
+
+
+FASTP_ARGS = fastp_args()
+TRUSEQ = ("AGATCGGAAGAGCACACGTCTGAACTCCAGTCA", "AGATCGGAAGAGCGTCGTGTAGGGAAAGAGTGT")
+
+
+def adapters_for(sample):
+    """(label, r1, r2) for a sample: the first adapter_sets entry that matches, else
+    the global adapter_r1/adapter_r2, else none (auto-detect only). An entry matches
+    on `match_path` (regex on the sample's first raw R1 path, e.g. the delivery
+    folder) and/or `match` (regex on the sample name); if both are given, both must
+    match. The validation mix uses its base sample's adapters."""
+    if sample == SPIKE:
+        sample = VAL.get("base_sample", sample)
+    f = config["fastp"]
+    path = SAMPLES[sample]["1"][0] if sample in SAMPLES else ""
+    for i, aset in enumerate(f.get("adapter_sets") or []):
+        mp, mn = aset.get("match_path"), aset.get("match")
+        if not mp and not mn:
+            raise ValueError(f"fastp.adapter_sets entry {i + 1} needs match_path and/or match")
+        if (not mp or re.search(mp, path)) and (not mn or re.search(mn, sample)):
+            return aset.get("label", f"set{i + 1}"), aset.get("r1", ""), aset.get("r2", "")
+    if f.get("adapter_r1") or f.get("adapter_r2"):
+        return "global", f.get("adapter_r1", ""), f.get("adapter_r2", "")
+    return "auto-detect only", "", ""
+
+
+def fastp_args_for(sample):
+    _, r1, r2 = adapters_for(sample)
+    a = []
+    if r1:
+        a.append(f"--adapter_sequence {r1}")
+    if r2:
+        a.append(f"--adapter_sequence_r2 {r2}")
+    return " ".join(a + [FASTP_ARGS])
+
+
+# Fail early if a sample matches no adapter set while sets are defined
+if config["fastp"].get("adapter_sets"):
+    _unmatched = [s for s in SAMPLES if adapters_for(s)[0] in ("global", "auto-detect only")]
+    if _unmatched and not config["fastp"].get("allow_unmatched_adapter_sets", False):
+        raise ValueError("fastp.adapter_sets: no adapter set matches these samples: "
+                         + ", ".join(_unmatched[:10]) + (" ..." if len(_unmatched) > 10 else "")
+                         + "  (add a set, or set fastp.allow_unmatched_adapter_sets: true)")
+KEEP_HUMAN = bool(config["host"].get("keep_human_reads", False))
+THREADS = config["threads"]
+RES = config["resources"]
+
+
+# --- targets --------------------------------------------------------------------------
+def all_targets():
+    t = [
+        f"{OUT}/qc_summary.tsv",
+        f"{OUT}/multiqc/multiqc_report.html",
+        f"{OUT}/provenance/versions.tsv",
+        f"{OUT}/provenance/run_info.tsv",
+    ]
+    t += expand(f"{OUT}/clean/{{sample}}.md5", sample=REAL_SAMPLES)
+    t += [f"{OUT}/sample_sheet.tsv", f"{OUT}/adapters/adapter_audit.tsv"]
+    if config.get("compute_raw_md5", True):
+        t.append(f"{OUT}/provenance/raw_md5.tsv")
+    if VALIDATE:
+        t.append(f"{OUT}/validation/spike_validation.txt")
+    return t
+
+
+rule all:
+    input:
+        all_targets(),
+
+
+localrules:
+    all, aggregate_summary, provenance, collect_raw_md5, merge_lanes, adapter_audit,
+
+
+# --- raw handling ---------------------------------------------------------------------
+rule merge_lanes:
+    """Only used for samples listing several lane files per mate."""
+    input:
+        lambda wc: SAMPLES[wc.sample][wc.mate],
+    output:
+        temp(f"{OUT}/raw_merged/{{sample}}_R{{mate}}.fastq.gz"),
+    shell:
+        "cat {input} > {output}"
+
+
+rule md5_raw:
+    input:
+        lambda wc: SAMPLES[wc.sample]["1"] + SAMPLES[wc.sample]["2"],
+    output:
+        f"{OUT}/provenance/raw_md5/{{sample}}.md5",
+    shell:
+        "md5sum {input} > {output}"
+
+
+rule collect_raw_md5:
+    input:
+        expand(f"{OUT}/provenance/raw_md5/{{sample}}.md5", sample=REAL_SAMPLES),
+    output:
+        f"{OUT}/provenance/raw_md5.tsv",
+    run:
+        with open(output[0], "w") as o:
+            o.write("sample\tmd5\tfile\n")
+            for p in input:
+                s = os.path.basename(p)[: -len(".md5")]
+                for line in open(p):
+                    md5, path = line.split(None, 1)
+                    o.write(f"{s}\t{md5}\t{path.strip()}\n")
+
+
+# --- adapter ID ---------------------------------------------------------------------
+rule adapters_raw:
+    # First lane file only: lanes of one library share adapters, and this keeps the
+    # audit from concatenating multi-lane samples just to read ~200k pairs.
+    input:
+        r1=lambda wc: SAMPLES[wc.sample]["1"][0],
+        r2=lambda wc: SAMPLES[wc.sample]["2"][0],
+    output:
+        tsv=f"{OUT}/adapters/raw/{{sample}}.tsv",
+        txt=f"{OUT}/adapters/raw/{{sample}}.txt",
+    params:
+        n=config["adapter_check"]["pairs"],
+        skip=config["adapter_check"]["skip"],
+    conda:
+        f"{ENVS}/python.yaml"
+    shell:
+        "python {SCRIPTS}/identify_adapters.py {input.r1} {input.r2} --sample {wildcards.sample}"
+        " --pairs {params.n} --skip {params.skip} --tsv {output.tsv} --txt {output.txt} > /dev/null"
+
+
+rule adapters_clean:
+    input:
+        r1=f"{OUT}/clean/{{sample}}_R1.fastq.gz",
+        r2=f"{OUT}/clean/{{sample}}_R2.fastq.gz",
+    output:
+        tsv=f"{OUT}/adapters/clean/{{sample}}.tsv",
+        txt=f"{OUT}/adapters/clean/{{sample}}.txt",
+    params:
+        n=config["adapter_check"]["pairs"],
+        skip=config["adapter_check"]["skip"],
+    conda:
+        f"{ENVS}/python.yaml"
+    shell:
+        "python {SCRIPTS}/identify_adapters.py {input.r1} {input.r2} --sample {wildcards.sample}"
+        " --pairs {params.n} --skip {params.skip} --tsv {output.tsv} --txt {output.txt} > /dev/null"
+
+
+# --- FastQC ---------------------------------------------------------------------
+rule fastqc_raw:
+    input:
+        r1=lambda wc: raw(wc.sample, "1"),
+        r2=lambda wc: raw(wc.sample, "2"),
+    output:
+        z1=f"{OUT}/fastqc/raw/{{sample}}_raw_R1_fastqc.zip",
+        z2=f"{OUT}/fastqc/raw/{{sample}}_raw_R2_fastqc.zip",
+    params:
+        d=f"{OUT}/fastqc/raw",
+        links=f"{OUT}/fastqc/raw/.links_{{sample}}",
+    threads: THREADS["fastqc"]
+    resources:
+        mem_mb=RES["default_mem_mb"],
+    log:
+        f"{OUT}/logs/fastqc_raw/{{sample}}.log",
+    conda:
+        f"{ENVS}/fastqc.yaml"
+    shell:
+        # symlink to standard names so reports are labelled by sample, not by provider file name
+        "mkdir -p {params.links} && "
+        "ln -sfn $(realpath {input.r1}) {params.links}/{wildcards.sample}_raw_R1.fastq.gz && "
+        "ln -sfn $(realpath {input.r2}) {params.links}/{wildcards.sample}_raw_R2.fastq.gz && "
+        "fastqc -q -t {threads} --outdir {params.d} "
+        "{params.links}/{wildcards.sample}_raw_R1.fastq.gz {params.links}/{wildcards.sample}_raw_R2.fastq.gz "
+        "> {log} 2>&1 && rm -rf {params.links}"
+
+
+rule fastqc_clean:
+    input:
+        r1=f"{OUT}/clean/{{sample}}_R1.fastq.gz",
+        r2=f"{OUT}/clean/{{sample}}_R2.fastq.gz",
+    output:
+        z1=f"{OUT}/fastqc/clean/{{sample}}_R1_fastqc.zip",
+        z2=f"{OUT}/fastqc/clean/{{sample}}_R2_fastqc.zip",
+    params:
+        d=f"{OUT}/fastqc/clean",
+    threads: THREADS["fastqc"]
+    resources:
+        mem_mb=RES["default_mem_mb"],
+    log:
+        f"{OUT}/logs/fastqc_clean/{{sample}}.log",
+    conda:
+        f"{ENVS}/fastqc.yaml"
+    shell:
+        "fastqc -q -t {threads} --outdir {params.d} {input.r1} {input.r2} > {log} 2>&1"
+
+
+# --- adapter check (pre-fastp) ---------------------------------------------------------
+rule adapter_verify:
+    """Stop a sample before fastp if its reads carry a different adapter family than
+    the one assigned to it in fastp.adapter_sets."""
+    input:
+        f"{OUT}/adapters/raw/{{sample}}.tsv",
+    output:
+        f"{OUT}/adapters/verify/{{sample}}.tsv",
+    params:
+        label=lambda wc: adapters_for(wc.sample)[0],
+        r1=lambda wc: adapters_for(wc.sample)[1],
+        r2=lambda wc: adapters_for(wc.sample)[2],
+        minev=config["fastp"].get("adapter_check_min_evidence_pct", 0.05),
+        warn="--warn-only" if config["fastp"].get("adapter_check_warn_only", False) else "",
+    log:
+        f"{OUT}/logs/adapter_verify/{{sample}}.log",
+    conda:
+        f"{ENVS}/python.yaml"
+    shell:
+        "python {SCRIPTS}/check_adapter_assignment.py --sample {wildcards.sample} --report {input}"
+        " --set-label '{params.label}' --r1 '{params.r1}' --r2 '{params.r2}'"
+        " --min-evidence-pct {params.minev} {params.warn} --out {output} 2> {log}"
+
+
+rule adapter_audit:
+    """`snakemake adapter_audit`: check every sample's adapters (minutes) before the full run."""
+    input:
+        expand(f"{OUT}/adapters/verify/{{sample}}.tsv", sample=REAL_SAMPLES),
+    output:
+        f"{OUT}/adapters/adapter_audit.tsv",
+    shell:
+        "python {SCRIPTS}/aggregate_tsv.py {output} {input} && "
+        "awk -F'\\t' 'NR>1{{n[$2]++}} END{{for(k in n) printf \"%s: %d samples\\n\", k, n[k]}}' {output}"
+
+
+# --- fastp ------------------------------------------------------------------------------
+rule fastp:
+    input:
+        r1=lambda wc: raw(wc.sample, "1"),
+        r2=lambda wc: raw(wc.sample, "2"),
+        adapters_ok=f"{OUT}/adapters/verify/{{sample}}.tsv",
+    output:
+        r1=temp(f"{OUT}/fastp/{{sample}}_R1.trimmed.fastq.gz"),
+        r2=temp(f"{OUT}/fastp/{{sample}}_R2.trimmed.fastq.gz"),
+        json=f"{OUT}/fastp/{{sample}}.fastp.json",
+        html=f"{OUT}/fastp/{{sample}}.fastp.html",
+    params:
+        args=lambda wc: fastp_args_for(wc.sample),
+    threads: min(16, int(THREADS["fastp"]))
+    resources:
+        mem_mb=RES["fastp_mem_mb"],
+    log:
+        f"{OUT}/logs/fastp/{{sample}}.log",
+    conda:
+        f"{ENVS}/fastp.yaml"
+    shell:
+        "fastp -i {input.r1} -I {input.r2} -o {output.r1} -O {output.r2} {params.args}"
+        " --thread {threads} --json {output.json} --html {output.html}"
+        " --report_title '{wildcards.sample}' > {log} 2>&1"
+
+
+# --- host removal ---------------------------------------------------------------------
+HOST_OUT = {
+    "r1": f"{OUT}/clean/{{sample}}_R1.fastq.gz",
+    "r2": f"{OUT}/clean/{{sample}}_R2.fastq.gz",
+    "counts": f"{OUT}/host/{{sample}}.host_counts.tsv",
+    "bt2log": f"{OUT}/host/{{sample}}.bowtie2.log",
+    "bam": temp(f"{OUT}/host/{{sample}}.host.bam"),
+}
+if KEEP_HUMAN:
+    HOST_OUT["h1"] = f"{OUT}/host/human/{{sample}}_human_R1.fastq.gz"
+    HOST_OUT["h2"] = f"{OUT}/host/human/{{sample}}_human_R2.fastq.gz"
+
+
+def human_cmd(wc):
+    if not KEEP_HUMAN:
+        return "true"
+    # -G 12: drop only pairs where BOTH mates are unmapped -> everything the filter removed
+    return (f"samtools fastq -@ 2 -n -G 12 -F 0x900 -c 6 "
+            f"-1 {OUT}/host/human/{wc.sample}_human_R1.fastq.gz "
+            f"-2 {OUT}/host/human/{wc.sample}_human_R2.fastq.gz "
+            f"-0 /dev/null -s /dev/null {OUT}/host/{wc.sample}.host.bam")
+
+
+rule host_removal:
+    input:
+        r1=f"{OUT}/fastp/{{sample}}_R1.trimmed.fastq.gz",
+        r2=f"{OUT}/fastp/{{sample}}_R2.trimmed.fastq.gz",
+    output:
+        **HOST_OUT,
+    params:
+        index=config["host"]["bowtie2_index"],
+        args=config["host"]["bowtie2_args"],
+        label=config["host"]["label"],
+        human=human_cmd,
+    threads: int(THREADS["bowtie2"])
+    resources:
+        mem_mb=RES["bowtie2_mem_mb"],
+    log:
+        f"{OUT}/logs/host/{{sample}}.log",
+    conda:
+        f"{ENVS}/bowtie2.yaml"
+    shell:
+        r"""
+        bowtie2 {params.args} -p {threads} -x {params.index} \
+            -1 {input.r1} -2 {input.r2} 2> {output.bt2log} \
+          | samtools view -@ 2 -b -1 -o {output.bam} - 2> {log}
+
+        total=$(samtools view -@ 2 -c -F 0x900 {output.bam})
+        nonh=$(samtools view -@ 2 -c -f 12 -F 0x900 {output.bam})
+
+        # keep only pairs in which BOTH mates failed to align to the host
+        samtools fastq -@ 2 -n -f 12 -F 0x900 -c 6 \
+            -1 {output.r1} -2 {output.r2} -0 /dev/null -s /dev/null {output.bam} 2>> {log}
+        {params.human} 2>> {log}
+
+        printf "key\tvalue\ninput_pairs\t%d\nnonhuman_pairs\t%d\nhost_reference\t%s\nbowtie2_index\t%s\nbowtie2_args\t%s\npair_rule\t%s\n" \
+            $((total / 2)) $((nonh / 2)) "{params.label}" "{params.index}" "{params.args}" \
+            "keep pair only if both mates unmapped (SAM flags 0x4 and 0x8; primary alignments)" \
+            > {output.counts}
+        """
+
+
+rule md5_clean:
+    input:
+        r1=f"{OUT}/clean/{{sample}}_R1.fastq.gz",
+        r2=f"{OUT}/clean/{{sample}}_R2.fastq.gz",
+    output:
+        f"{OUT}/clean/{{sample}}.md5",
+    shell:
+        # basenames only, so the file can accompany an SRA upload
+        "cd $(dirname {input.r1}) && md5sum $(basename {input.r1}) $(basename {input.r2})"
+        " > $(basename {output})"
+
+
+# --- stats + summary ---------------------------------------------------------------------
+rule seqkit_stats:
+    input:
+        raw1=lambda wc: raw(wc.sample, "1"),
+        raw2=lambda wc: raw(wc.sample, "2"),
+        c1=f"{OUT}/clean/{{sample}}_R1.fastq.gz",
+        c2=f"{OUT}/clean/{{sample}}_R2.fastq.gz",
+    output:
+        raw=f"{OUT}/seqkit/{{sample}}.raw.tsv",
+        clean=f"{OUT}/seqkit/{{sample}}.clean.tsv",
+    threads: int(THREADS["seqkit"])
+    resources:
+        mem_mb=RES["default_mem_mb"],
+    conda:
+        f"{ENVS}/seqkit.yaml"
+    shell:
+        "seqkit stats -T -a -j {threads} {input.raw1} {input.raw2} > {output.raw} && "
+        "seqkit stats -T -a -j {threads} {input.c1} {input.c2} > {output.clean}"
+
+
+rule summarize_sample:
+    input:
+        fastp=f"{OUT}/fastp/{{sample}}.fastp.json",
+        host=f"{OUT}/host/{{sample}}.host_counts.tsv",
+        seqkit=f"{OUT}/seqkit/{{sample}}.clean.tsv",
+        araw=f"{OUT}/adapters/raw/{{sample}}.tsv",
+        aclean=f"{OUT}/adapters/clean/{{sample}}.tsv",
+    output:
+        f"{OUT}/summary/{{sample}}.tsv",
+    conda:
+        f"{ENVS}/python.yaml"
+    shell:
+        "python {SCRIPTS}/summarize_sample.py --sample {wildcards.sample}"
+        " --fastp-json {input.fastp} --host-counts {input.host} --seqkit {input.seqkit}"
+        " --adapters-raw {input.araw} --adapters-clean {input.aclean} --out {output}"
+
+
+rule aggregate_summary:
+    input:
+        expand(f"{OUT}/summary/{{sample}}.tsv", sample=REAL_SAMPLES),
+    output:
+        tsv=f"{OUT}/qc_summary.tsv",
+        mqc=f"{OUT}/summary/biodigs_qc_mqc.tsv",
+    run:
+        shell("python {SCRIPTS}/aggregate_tsv.py {output.tsv} {input}")
+        cols = ["sample", "raw_pairs", "pct_pairs_removed_fastp", "pct_pairs_human",
+                "final_pairs", "pct_pairs_retained_overall",
+                "pct_reads_adapter_signature_raw", "pct_reads_adapter_signature_clean",
+                "pct_pairs_readthrough_clean", "counts_consistent"]
+        with open(output.tsv) as fh:
+            rows = list(csv.DictReader(fh, delimiter="\t"))
+        with open(output.mqc, "w") as o:
+            o.write("# id: 'biodigs_qc'\n# section_name: 'BioDIGS short-read QC summary'\n"
+                    "# description: 'Per-sample read accounting: fastp filtering, human pairs removed "
+                    "(both mates unaligned to T2T-CHM13 required to keep a pair), and adapter "
+                    "signal before/after.'\n# plot_type: 'table'\n")
+            o.write("\t".join(cols) + "\n")
+            for r in rows:
+                o.write("\t".join(str(r.get(c, "NA")) for c in cols) + "\n")
+
+
+# --- per-sample sheet ---------------------------------------------------------------------
+SHEET = config.get("sample_sheet", {}) or {}
+
+
+rule scan_headers:
+    """Every R1 header: which instrument/run/flowcell/lane/index each read came from."""
+    input:
+        r1=lambda wc: raw(wc.sample, "1"),
+    output:
+        f"{OUT}/runinfo/{{sample}}.header_counts.tsv",
+    resources:
+        mem_mb=RES["default_mem_mb"],
+    log:
+        f"{OUT}/logs/scan_headers/{{sample}}.log",
+    shell:
+        "bash {SCRIPTS}/scan_headers.sh {input.r1} {output} 2> {log}"
+
+
+rule sample_sheet:
+    input:
+        headers=expand(f"{OUT}/runinfo/{{sample}}.header_counts.tsv", sample=REAL_SAMPLES),
+        fastp=expand(f"{OUT}/fastp/{{sample}}.fastp.json", sample=REAL_SAMPLES),
+        seqkit=expand(f"{OUT}/seqkit/{{sample}}.raw.tsv", sample=REAL_SAMPLES),
+        qc=f"{OUT}/qc_summary.tsv",
+        samples=config["samples"],
+        metadata=[SHEET["metadata"]] if SHEET.get("metadata") else [],
+    output:
+        tsv=f"{OUT}/sample_sheet.tsv",
+        csv=f"{OUT}/sample_sheet.csv",
+    params:
+        meta=f"--metadata {SHEET['metadata']}" if SHEET.get("metadata") else "",
+    log:
+        f"{OUT}/logs/sample_sheet.log",
+    conda:
+        f"{ENVS}/python.yaml"
+    shell:
+        "python {SCRIPTS}/build_sample_sheet.py --samples {input.samples} --qc-summary {input.qc}"
+        " --headers-dir {OUT}/runinfo --fastp-dir {OUT}/fastp --seqkit-dir {OUT}/seqkit"
+        " {params.meta} --exclude {SPIKE} --out-tsv {output.tsv} --out-csv {output.csv} > {log} 2>&1"
+
+
+# --- MultiQC ---------------------------------------------------------------------
+rule multiqc:
+    input:
+        expand(f"{OUT}/fastqc/raw/{{sample}}_raw_R{{m}}_fastqc.zip", sample=REAL_SAMPLES, m=[1, 2]),
+        expand(f"{OUT}/fastqc/clean/{{sample}}_R{{m}}_fastqc.zip", sample=REAL_SAMPLES, m=[1, 2]),
+        expand(f"{OUT}/fastp/{{sample}}.fastp.json", sample=REAL_SAMPLES),
+        expand(f"{OUT}/host/{{sample}}.bowtie2.log", sample=REAL_SAMPLES),
+        f"{OUT}/summary/biodigs_qc_mqc.tsv",
+    output:
+        f"{OUT}/multiqc/multiqc_report.html",
+    params:
+        d=f"{OUT}/multiqc",
+        cfg=os.path.join(workflow.basedir, "multiqc_config.yaml"),
+    log:
+        f"{OUT}/logs/multiqc.log",
+    conda:
+        f"{ENVS}/multiqc.yaml"
+    shell:
+        "printf '%s\\n' {input} > {params.d}/file_list.txt && "
+        "multiqc --force -c {params.cfg} -o {params.d} -n multiqc_report.html"
+        " --file-list {params.d}/file_list.txt > {log} 2>&1"
+
+
+# --- provenance ---------------------------------------------------------------------
+VERSION_CMDS = {
+    "fastp": ("fastp.yaml", "fastp --version 2>&1 | head -1"),
+    "bowtie2": ("bowtie2.yaml", "bowtie2 --version | head -1 | awk '{print $NF}'"),
+    "samtools": ("bowtie2.yaml", "samtools --version | head -1 | awk '{print $2}'"),
+    "seqkit": ("seqkit.yaml", "seqkit version"),
+    "fastqc": ("fastqc.yaml", "fastqc --version"),
+    "multiqc": ("multiqc.yaml", "multiqc --version"),
+    "python": ("python.yaml", "python --version 2>&1"),
+}
+
+for _tool, (_env, _cmd) in VERSION_CMDS.items():
+
+    rule:
+        name:
+            f"version_{_tool.replace('+', '_')}"
+        output:
+            f"{OUT}/provenance/versions/{_tool}.txt",
+        params:
+            tool=_tool,
+            cmd=_cmd,
+        conda:
+            f"{ENVS}/{_env}"
+        shell:
+            "printf '%s\\t%s\\n' {params.tool} \"$({params.cmd})\" > {output}"
+
+
+rule provenance:
+    input:
+        expand(f"{OUT}/provenance/versions/{{tool}}.txt", tool=list(VERSION_CMDS)),
+    output:
+        versions=f"{OUT}/provenance/versions.tsv",
+        info=f"{OUT}/provenance/run_info.tsv",
+        cfg=f"{OUT}/provenance/config.yaml",
+        smp=f"{OUT}/provenance/samples.tsv",
+    run:
+        import shutil
+        import snakemake as _smk
+
+        with open(output.versions, "w") as o:
+            o.write("tool\tversion\n")
+            o.write(f"snakemake\t{_smk.__version__}\n")
+            for p in input:
+                o.write(open(p).read())
+        shutil.copy(workflow.configfiles[-1], output.cfg)
+        shutil.copy(config["samples"], output.smp)
+        with open(os.path.join(os.path.dirname(output.info), "fastp_adapters_per_sample.tsv"), "w") as o:
+            o.write("sample\tadapter_set\tadapter_r1\tadapter_r2\tfastp_args\n")
+            for smp in SAMPLES:
+                lab, r1, r2 = adapters_for(smp)
+                o.write(f"{smp}\t{lab}\t{r1}\t{r2}\t{fastp_args_for(smp)}\n")
+        idx = config["host"]["bowtie2_index"]
+        idx_dir = os.path.dirname(idx) or "."
+        idx_files = sorted(f for f in os.listdir(idx_dir)
+                           if f.startswith(os.path.basename(idx) + ".")) if os.path.isdir(idx_dir) else []
+        with open(output.info, "w") as o:
+            o.write("key\tvalue\n")
+            o.write(f"run_date\t{datetime.datetime.now().isoformat(timespec='seconds')}\n")
+            o.write(f"host_reference\t{config['host']['label']}\n")
+            o.write(f"bowtie2_index\t{idx}\n")
+            for f in idx_files:
+                st = os.stat(os.path.join(idx_dir, f))
+                o.write(f"index_file\t{f} ({st.st_size} bytes)\n")
+            o.write(f"bowtie2_args\t{config['host']['bowtie2_args']}\n")
+            o.write(f"fastp_args_common\t{FASTP_ARGS}\n")
+            for i, aset in enumerate(config["fastp"].get("adapter_sets") or []):
+                o.write(f"fastp_adapter_set\t{aset.get('label', i + 1)}: match_path /{aset.get('match_path', '')}/ "
+                        f"match /{aset.get('match', '')}/ "
+                        f"R1={aset.get('r1', '')} R2={aset.get('r2', '')}\n")
+            o.write("pair_rule\tkeep pair only if both mates unmapped to host\n")
+            o.write(f"n_samples\t{len(REAL_SAMPLES)}\n")
+
+
+# --- validation ---------------------------------------------------------------------
+if VALIDATE:
+
+    rule spike_simulate:
+        input:
+            fasta=VAL["human_fasta"],
+        output:
+            r1=f"{OUT}/validation/spike_R1.fastq.gz",
+            r2=f"{OUT}/validation/spike_R2.fastq.gz",
+        params:
+            fai=(VAL["human_fasta"] + ".fai") if os.path.exists(VAL["human_fasta"] + ".fai")
+                else f"{OUT}/validation/human_reference.fai",
+            n=VAL.get("spike_pairs", 50000),
+            seed=VAL.get("seed", 1),
+            a1=adapters_for(VAL["base_sample"])[1] or TRUSEQ[0],
+            a2=adapters_for(VAL["base_sample"])[2] or TRUSEQ[1],
+        log:
+            f"{OUT}/logs/validation/spike_simulate.log",
+        conda:
+            f"{ENVS}/python.yaml"
+        shell:
+            "python {SCRIPTS}/simulate_reads.py --fasta {input.fasta} --fai {params.fai}"
+            " --pairs {params.n} --seed {params.seed} --tag {SPIKE_TAG}"
+            " --adapter-r1 {params.a1} --adapter-r2 {params.a2}"
+            " --out-r1 {output.r1} --out-r2 {output.r2} > {log} 2>&1"
+
+    rule spike_mix:
+        input:
+            b1=lambda wc: raw(VAL["base_sample"], "1"),
+            b2=lambda wc: raw(VAL["base_sample"], "2"),
+            s1=f"{OUT}/validation/spike_R1.fastq.gz",
+            s2=f"{OUT}/validation/spike_R2.fastq.gz",
+        output:
+            r1=f"{OUT}/validation/spike_mix_R1.fastq.gz",
+            r2=f"{OUT}/validation/spike_mix_R2.fastq.gz",
+        params:
+            n=VAL.get("base_pairs", 500000),
+        conda:
+            f"{ENVS}/seqkit.yaml"
+        shell:
+            "{{ seqkit head -n {params.n} {input.b1}; seqkit seq {input.s1}; }} | gzip -c > {output.r1} && "
+            "{{ seqkit head -n {params.n} {input.b2}; seqkit seq {input.s2}; }} | gzip -c > {output.r2}"
+
+    rule spike_validate:
+        input:
+            mix=f"{OUT}/validation/spike_mix_R1.fastq.gz",
+            clean=f"{OUT}/clean/{SPIKE}_R1.fastq.gz",
+            summary=f"{OUT}/summary/{SPIKE}.tsv",
+        output:
+            f"{OUT}/validation/spike_validation.txt",
+        params:
+            leak=VAL.get("max_leak_pct", 0.5),
+        conda:
+            f"{ENVS}/python.yaml"
+        shell:
+            "python {SCRIPTS}/validate_spike.py --mix-r1 {input.mix} --clean-r1 {input.clean}"
+            " --tag {SPIKE_TAG} --max-leak-pct {params.leak} --out {output}"

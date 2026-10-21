@@ -1,0 +1,96 @@
+# =============================================================================
+# BioDIGS short-read QC: fastp -> Bowtie2 host removal -> QC reports
+#
+# Copy to config/config.yaml and edit the paths marked EDIT
+# Values below are the ones used for the BioDIGS soil samples
+# =============================================================================
+
+samples: config/samples.tsv #EDIT see config/samples.tsv.example for format
+outdir: results
+
+# --- Host (human) reference --------------------------------------------------
+host:
+  bowtie2_index: /path/to/hs1/hs1 #EDIT: index prefix for Bowtie2
+  label: "T2T-CHM13v2.0 (UCSC hs1)"
+  bowtie2_args: "--very-sensitive --reorder"
+  # Writes the removed human reads to a separate file in outdir/host/human.
+  # If false, they are discarded. Off by default.
+  keep_human_reads: false
+
+# --- fastp -------------------------------------------------------------------
+fastp:
+  # Adapters use in the reads, assigned per sequencing directory.
+  # match_path is a regex on the sample's delivery path (from samples.tsv).
+  # Replace these with your own adapters and delivery dates.
+  adapter_sets:
+    - label: nextera_2023
+      match_path: "/2023\\.09\\.25[^/]*/"
+      r1: CTGTCTCTTATACACATCT
+      r2: CTGTCTCTTATACACATCT
+    - label: truseq_2025
+      match_path: "/2025\\.02\\.19[^/]*/"
+      r1: AGATCGGAAGAGCACACGTCTGAACTCCAGTCA
+      r2: AGATCGGAAGAGCGTCGTGTAGGGAAAGAGTGT
+  # Used only for samples no set matches (the run refuses to start if any sample is
+  # unmatched while sets are defined, unless allow_unmatched_adapter_sets: true)
+  adapter_r1: ""
+  adapter_r2: ""
+  allow_unmatched_adapter_sets: false
+  # Before fastp, every sample's observed adapter family is checked against its set;
+  # a mismatch stops that sample. LOW_EVIDENCE (too little
+  # read-through to tell, e.g. long-insert libraries) passes with a flag.
+  adapter_check_min_evidence_pct: 0.05
+  adapter_check_warn_only: false
+  max_len: 151
+  detect_adapter_for_pe: true
+  trim_poly_g: true
+  poly_g_min_len: 10
+  cut_right: true
+  cut_right_window_size: 4
+  cut_right_mean_quality: 15
+  qualified_quality_phred: 15
+  unqualified_percent_limit: 40
+  n_base_limit: 5
+  length_required: 50
+  dedup: false
+  extra: ""
+
+# --- Adapter identification  ----------------------------
+adapter_check:
+  pairs: 200000
+  skip: 10000
+
+# --- Raw-file checksums  ---------------------------------
+compute_raw_md5: true
+
+# --- Per-sample sheet -----------------------------------------------------------
+# results/sample_sheet.{tsv,csv}: one row per sample — instrument, run, flowcell,
+# lanes, index, delivery folder/date, read lengths, quality/adapter/insert/
+# duplication metrics, cleaning losses.
+sample_sheet:
+  metadata: ""
+
+# --- Threads / memory -----------------------------------------------------
+threads:
+  fastp: 8
+  bowtie2: 16
+  seqkit: 4
+  fastqc: 2
+resources:
+  bowtie2_mem_mb: 12000
+  fastp_mem_mb: 4000
+  default_mem_mb: 2000
+
+# --- Optional human spike-in ------------------------------------------------
+# Simulates human read pairs (with adapter read-through + poly-G) from the SAME
+# reference the filter uses, mixes them into the first N pairs of a real soil
+# sample, runs the mix through the identical pipeline as sample "SPIKECHECK",
+# and reports leakage and soil-read loss.
+validation:
+  enabled: false
+  human_fasta: /path/to/hs1.fa  # EDIT
+  base_sample: A01_10           # must be a sample in samples.tsv
+  base_pairs: 500000
+  spike_pairs: 50000
+  max_leak_pct: 0.5
+  seed: 1
